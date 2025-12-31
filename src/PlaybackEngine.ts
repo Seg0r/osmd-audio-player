@@ -139,7 +139,14 @@ export default class PlaybackEngine {
   }
 
   async play() {
+    if (!this.scheduler) return;
     await this.ac.resume();
+
+    if (this.state === PlaybackState.PAUSED) {
+      this.setState(PlaybackState.PLAYING);
+      this.scheduler.resume();
+      return;
+    }
 
     if (this.state === PlaybackState.INIT || this.state === PlaybackState.STOPPED) {
       this.cursor.show();
@@ -161,10 +168,12 @@ export default class PlaybackEngine {
 
   pause() {
     this.setState(PlaybackState.PAUSED);
+    if (!this.scheduler) return;
+    // Pause the scheduler first to prevent any further scheduling while we suspend the audio context.
+    // Avoid rewinding scheduler state here; resume should continue from the same stepQueueIndex/tick.
+    this.scheduler.pause();
     this.ac.suspend();
     this.stopPlayers();
-    this.scheduler.setIterationStep(this.currentIterationStep);
-    this.scheduler.pause();
     this.clearTimeouts();
   }
 
@@ -197,7 +206,26 @@ export default class PlaybackEngine {
     let steps = 0;
     while (!this.cursor.Iterator.EndReached) {
       if (this.cursor.Iterator.CurrentVoiceEntries) {
-        this.scheduler.loadNotes(this.cursor.Iterator.CurrentVoiceEntries);
+        // Prefer OSMD's absolute cursor timestamp for the current position to prevent time compression.
+        // Fallback to legacy behavior if timestamp isn't available in the current OSMD build.
+        let timeStampRealValue: number | null = null;
+        try {
+          const iterator: any = this.cursor.Iterator as any;
+          const timeStamp: any = iterator.CurrentTimeStamp ?? iterator.currentTimeStamp ?? null;
+          if (timeStamp && typeof timeStamp.RealValue === "number") {
+            timeStampRealValue = timeStamp.RealValue;
+          } else if (timeStamp && typeof timeStamp.realValue === "number") {
+            timeStampRealValue = timeStamp.realValue;
+          }
+
+          if (typeof timeStampRealValue === "number" && !Number.isFinite(timeStampRealValue)) {
+            timeStampRealValue = null;
+          }
+        } catch {
+          timeStampRealValue = null;
+        }
+
+        this.scheduler.loadNotes(this.cursor.Iterator.CurrentVoiceEntries, timeStampRealValue);
       }
       this.cursor.next();
       ++steps;

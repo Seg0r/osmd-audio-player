@@ -18,6 +18,11 @@ export default class PlaybackScheduler {
   private audioContextStartTime: number = 0;
 
   private schedulerIntervalHandle: number = null;
+  /**
+   * Track all created interval handles so we can reliably clear them on reset.
+   * This prevents duplicate schedulers from running concurrently (perceived tempo increase).
+   */
+  private schedulerIntervalHandles = new Set<number>();
   private scheduleInterval: number = 200; // Milliseconds
   private schedulePeriod: number = 500;
   private tickDenominator: number = 1024;
@@ -51,13 +56,20 @@ export default class PlaybackScheduler {
   }
 
   start() {
-    this.playing = true;
     this.stepQueue.sort();
-    this.audioContextStartTime = this.audioContext.currentTime;
-    this.currentTickTimestamp = this.audioContextTime;
-    if (!this.schedulerIntervalHandle) {
+    if (this.schedulerIntervalHandle === null) {
+      this.playing = true;
+      // Fresh start: reset timebase relative to "now".
+      this.audioContextStartTime = this.audioContext.currentTime;
+      this.currentTickTimestamp = this.audioContextTime;
       this.schedulerIntervalHandle = window.setInterval(() => this.scheduleIterationStep(), this.scheduleInterval);
+      this.schedulerIntervalHandles.add(this.schedulerIntervalHandle);
+      return;
     }
+    // If we're already running an interval (e.g. resume after pause), do NOT reset the timebase.
+    // Just resume scheduling from the current tick/stepQueueIndex.
+    this.playing = true;
+    this.currentTickTimestamp = this.audioContextTime;
   }
 
   setIterationStep(step: number) {
@@ -68,6 +80,8 @@ export default class PlaybackScheduler {
 
   pause() {
     this.playing = false;
+    // Clear bookkeeping so resume can re-schedule cleanly.
+    this.scheduledTicks.clear();
   }
 
   resume() {
@@ -80,13 +94,24 @@ export default class PlaybackScheduler {
     this.currentTick = 0;
     this.currentTickTimestamp = 0;
     this.stepQueueIndex = 0;
-    clearInterval(this.scheduleInterval);
+    this.audioContextStartTime = 0;
+    this.scheduledTicks.clear();
+    // IMPORTANT: clear the *interval handle*, not the interval duration.
+    for (const handle of this.schedulerIntervalHandles) {
+      clearInterval(handle);
+    }
+    this.schedulerIntervalHandles.clear();
     this.schedulerIntervalHandle = null;
   }
 
-  loadNotes(currentVoiceEntries: VoiceEntry[]) {
+  loadNotes(currentVoiceEntries: VoiceEntry[], iteratorTimeStampRealValue?: number | null) {
     let thisTick = this.lastTickOffset;
-    if (this.stepQueue.steps.length > 0) {
+
+    // Use absolute cursor timestamp if available to prevent time compression
+    if (typeof iteratorTimeStampRealValue === "number" && Number.isFinite(iteratorTimeStampRealValue)) {
+      thisTick = this.lastTickOffset + Math.round(iteratorTimeStampRealValue * this.tickDenominator);
+    } else if (this.stepQueue.steps.length > 0) {
+      // Fallback to old heuristic if timestamp unavailable
       thisTick = this.stepQueue.getFirstEmptyTick();
     }
 
@@ -94,7 +119,10 @@ export default class PlaybackScheduler {
       if (!entry.IsGrace) {
         for (let note of entry.Notes) {
           this.stepQueue.addNote(thisTick, note);
-          this.stepQueue.createStep(thisTick + note.Length.RealValue * this.tickDenominator);
+          // Skip creating empty end steps when using absolute timestamps to avoid scheduling noise
+          if (!(typeof iteratorTimeStampRealValue === "number" && Number.isFinite(iteratorTimeStampRealValue))) {
+            this.stepQueue.createStep(thisTick + note.Length.RealValue * this.tickDenominator);
+          }
         }
       }
     }
